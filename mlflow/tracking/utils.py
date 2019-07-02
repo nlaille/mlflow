@@ -8,6 +8,7 @@ from six.moves import urllib
 from mlflow.store import DEFAULT_LOCAL_FILE_AND_ARTIFACT_PATH
 from mlflow.store.dbmodels.db_types import DATABASE_ENGINES
 from mlflow.store.file_store import FileStore
+from mlflow.store.docker_file_store import DockerFileStore
 from mlflow.store.rest_store import RestStore
 from mlflow.tracking.registry import TrackingStoreRegistry
 from mlflow.utils import env, rest_utils
@@ -91,6 +92,10 @@ def _get_file_store(store_uri, **_):
     return FileStore(store_uri, store_uri)
 
 
+def _get_docker_file_store(store_uri, **_):
+    return FileStore(store_uri, store_uri)
+
+
 def _get_sqlalchemy_store(store_uri, artifact_uri):
     from mlflow.store.sqlalchemy_store import SqlAlchemyStore
     if artifact_uri is None:
@@ -131,6 +136,7 @@ _tracking_store_registry = TrackingStoreRegistry()
 _tracking_store_registry.register('', _get_file_store)
 _tracking_store_registry.register('file', _get_file_store)
 _tracking_store_registry.register('databricks', _get_databricks_rest_store)
+_tracking_store_registry.register('dockerfile', _get_docker_file_store)
 
 for scheme in ['http', 'https']:
     _tracking_store_registry.register(scheme, _get_rest_store)
