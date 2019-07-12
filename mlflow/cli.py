@@ -120,9 +120,9 @@ def run(uri, entry_point, version, param_list, experiment_name, experiment_id, b
         except ValueError as e:
             eprint("Invalid backend config JSON. Parse error: %s" % e)
             raise
-    if backend == "kubernetes":
+    if backend in ["databricks", "kubernetes"]:
         if backend_config is None:
-            eprint("Specify 'backend_config' when using kubernetes mode.")
+            eprint("Specify 'backend_config' when using databricks or kubernetes mode.")
             sys.exit(1)
     try:
         projects.run(

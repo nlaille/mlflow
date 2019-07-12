@@ -2,6 +2,8 @@ from __future__ import absolute_import
 import logging
 import docker
 import time
+import os
+import yaml
 from threading import RLock
 import kubernetes
 from datetime import datetime
@@ -9,8 +11,57 @@ from datetime import datetime
 from mlflow.exceptions import ExecutionException
 from mlflow.projects.submitted_run import SubmittedRun
 from mlflow.entities import RunStatus
+from mlflow import tracking
 
 _logger = logging.getLogger(__name__)
+
+
+def before_run_validations(tracking_uri, backend_config):
+    """Validations to perform before running a project on Kubernetes."""
+    if backend_config is None:
+        raise ExecutionException("Backend spec must be provided when launching MLflow project "
+                                 "runs on Kubernetes.")
+    # TODO: which tracking url are supported
+    if not tracking.utils._is_databricks_uri(tracking_uri) and \
+            not tracking.utils._is_http_uri(tracking_uri):
+        raise ExecutionException(
+            "When running on Databricks, the MLflow tracking URI must be of the form "
+            "'databricks' or 'databricks://profile', or a remote HTTP URI accessible to both the "
+            "current client and code running on Databricks. Got local tracking URI %s. "
+            "Please specify a valid tracking URI via mlflow.set_tracking_uri or by setting the "
+            "MLFLOW_TRACKING_URI environment variable." % tracking_uri)
+
+
+def validate_project_execution(project):
+    if not project.docker_env:
+        raise ExecutionException(
+            "Only docker-based projects are supported on Kubernetes.")
+
+
+def parse_kubernetes_config(backend_config):
+    """
+    Creates build context tarfile containing Dockerfile and project code, returning path to tarfile
+    """
+    if not backend_config:
+        raise ExecutionException("Backend_config file not found.")
+    kube_config = backend_config.copy()
+    if 'kube-job-template-path' not in backend_config.keys():
+        raise ExecutionException("'kube-job-template-path' attribute must be specified in "
+                                 "backend_config.")
+    kube_job_template = backend_config['kube-job-template-path']
+    if os.path.exists(kube_job_template):
+        with open(kube_job_template, 'r') as job_template:
+            yaml_obj = yaml.safe_load(job_template.read())
+        kube_job_template = yaml_obj
+        kube_config['kube-job-template'] = kube_job_template
+    else:
+        raise ExecutionException("Could not find 'kube-job-template-path': {}".format(
+            kube_job_template))
+    if 'kube-context' not in backend_config.keys():
+        raise ExecutionException("Could not find kube-context in backend_config.")
+    if 'image-uri' not in backend_config.keys():
+        raise ExecutionException("Could not find 'image-uri' in backend_config.")
+    return kube_config
 
 
 def push_image_to_registry(image_tag):

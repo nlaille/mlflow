@@ -1,10 +1,6 @@
 from abc import abstractmethod
 
-import os
-import signal
 import logging
-
-from mlflow.entities import RunStatus
 
 _logger = logging.getLogger(__name__)
 
@@ -56,49 +52,3 @@ class SubmittedRun(object):
         pass
 
 
-class LocalSubmittedRun(SubmittedRun):
-    """
-    Instance of ``SubmittedRun`` corresponding to a subprocess launched to run an entry point
-    command locally.
-    """
-    def __init__(self, run_id, command_proc):
-        super(LocalSubmittedRun, self).__init__()
-        self._run_id = run_id
-        self.command_proc = command_proc
-
-    @property
-    def run_id(self):
-        return self._run_id
-
-    def wait(self):
-        return self.command_proc.wait() == 0
-
-    def cancel(self):
-        # Interrupt child process if it hasn't already exited
-        if self.command_proc.poll() is None:
-            # Kill the the process tree rooted at the child if it's the leader of its own process
-            # group, otherwise just kill the child
-            try:
-                if self.command_proc.pid == os.getpgid(self.command_proc.pid):
-                    os.killpg(self.command_proc.pid, signal.SIGTERM)
-                else:
-                    self.command_proc.terminate()
-            except OSError:
-                # The child process may have exited before we attempted to terminate it, so we
-                # ignore OSErrors raised during child process termination
-                _logger.info(
-                    "Failed to terminate child process (PID %s) corresponding to MLflow "
-                    "run with ID %s. The process may have already exited.",
-                    self.command_proc.pid, self._run_id)
-            self.command_proc.wait()
-
-    def _get_status(self):
-        exit_code = self.command_proc.poll()
-        if exit_code is None:
-            return RunStatus.RUNNING
-        if exit_code == 0:
-            return RunStatus.FINISHED
-        return RunStatus.FAILED
-
-    def get_status(self):
-        return RunStatus.to_string(self._get_status())

@@ -7,13 +7,10 @@ from __future__ import print_function
 from distutils import dir_util
 import hashlib
 import json
-import yaml
 import os
-import sys
 import re
 import shutil
 from six.moves import urllib
-import subprocess
 import tempfile
 import logging
 import posixpath
@@ -21,14 +18,14 @@ import docker
 
 import mlflow.tracking as tracking
 import mlflow.tracking.fluent as fluent
-from mlflow.projects.submitted_run import LocalSubmittedRun, SubmittedRun
+from mlflow.projects.submitted_run import SubmittedRun
 from mlflow.projects import _project_spec
+from mlflow.projects.utils import get_run_env_vars
 from mlflow.exceptions import ExecutionException, MlflowException
 from mlflow.entities import RunStatus, SourceType
 from mlflow.tracking.fluent import _get_experiment_id
 from mlflow.tracking.context.default_context import _get_user
 from mlflow.tracking.context.git_context import _get_git_commit
-import mlflow.projects.databricks
 from mlflow.utils import process
 from mlflow.utils.file_utils import path_to_local_sqlite_uri, path_to_local_file_uri
 from mlflow.utils.mlflow_tags import MLFLOW_PROJECT_ENV, MLFLOW_DOCKER_IMAGE_NAME, \
@@ -50,141 +47,6 @@ _PROJECT_TAR_ARCHIVE_NAME = "mlflow-project-docker-build-context"
 _MLFLOW_DOCKER_TRACKING_DIR_PATH = "/mlflow/tmp/mlruns"
 
 _logger = logging.getLogger(__name__)
-
-
-def _resolve_experiment_id(experiment_name=None, experiment_id=None):
-    """
-    Resolve experiment.
-
-    Verifies either one or other is specified - cannot be both selected.
-
-    :param experiment_name: Name of experiment under which to launch the run.
-    :param experiment_id: ID of experiment under which to launch the run.
-    :return: int
-    """
-
-    if experiment_name and experiment_id:
-        raise MlflowException("Specify only one of 'experiment_name' or 'experiment_id'.")
-
-    exp_id = experiment_id
-    if experiment_name:
-        client = tracking.MlflowClient()
-        exp_id = client.get_experiment_by_name(experiment_name).experiment_id
-    exp_id = exp_id or _get_experiment_id()
-    return exp_id
-
-
-def _run(uri, experiment_id, entry_point="main", version=None, parameters=None,
-         backend=None, backend_config=None, use_conda=True,
-         storage_dir=None, synchronous=True, run_id=None):
-    """
-    Helper that delegates to the project-running method corresponding to the passed-in backend.
-    Returns a ``SubmittedRun`` corresponding to the project run.
-    """
-
-    parameters = parameters or {}
-    work_dir = _fetch_project(uri=uri, force_tempdir=False, version=version)
-    project = _project_spec.load_project(work_dir)
-    _validate_execution_environment(project, backend)
-    project.get_entry_point(entry_point)._validate_parameters(parameters)
-    if run_id:
-        active_run = tracking.MlflowClient().get_run(run_id)
-    else:
-        active_run = _create_run(uri, experiment_id, work_dir, entry_point)
-
-    # Consolidate parameters for logging.
-    # `storage_dir` is `None` since we want to log actual path not downloaded local path
-    entry_point_obj = project.get_entry_point(entry_point)
-    final_params, extra_params = entry_point_obj.compute_parameters(parameters, storage_dir=None)
-    for key, value in (list(final_params.items()) + list(extra_params.items())):
-        tracking.MlflowClient().log_param(active_run.info.run_id, key, value)
-
-    repo_url = _get_git_repo_url(work_dir)
-    if repo_url is not None:
-        for tag in [MLFLOW_GIT_REPO_URL, LEGACY_MLFLOW_GIT_REPO_URL]:
-            tracking.MlflowClient().set_tag(active_run.info.run_id, tag, repo_url)
-
-    # Add branch name tag if a branch is specified through -version
-    if _is_valid_branch_name(work_dir, version):
-        for tag in [MLFLOW_GIT_BRANCH, LEGACY_MLFLOW_GIT_BRANCH_NAME]:
-            tracking.MlflowClient().set_tag(active_run.info.run_id, tag, version)
-
-    if backend == "databricks":
-        tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_BACKEND,
-                                        "databricks")
-        from mlflow.projects.databricks import run_databricks
-        return run_databricks(
-            remote_run=active_run,
-            uri=uri, entry_point=entry_point, work_dir=work_dir, parameters=parameters,
-            experiment_id=experiment_id, cluster_spec=backend_config)
-
-    elif backend == "local" or backend is None:
-        command = []
-        command_separator = " "
-        # If a docker_env attribute is defined in MLproject then it takes precedence over conda yaml
-        # environments, so the project will be executed inside a docker container.
-        if project.docker_env:
-            tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_ENV,
-                                            "docker")
-            tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_BACKEND,
-                                            "local")
-            _validate_docker_env(project)
-            _validate_docker_installation()
-            image = _build_docker_image(work_dir=work_dir,
-                                        image_uri=project.name,
-                                        base_image=project.docker_env.get('image'),
-                                        run_id=active_run.info.run_id)
-            command += _get_docker_command(image=image, active_run=active_run)
-        # Synchronously create a conda environment (even though this may take some time)
-        # to avoid failures due to multiple concurrent attempts to create the same conda env.
-        elif use_conda:
-            tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_ENV, "conda")
-            tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_BACKEND, "local")
-            command_separator = " && "
-            conda_env_name = _get_or_create_conda_env(project.conda_env_path)
-            command += _get_conda_command(conda_env_name)
-        # In synchronous mode, run the entry point command in a blocking fashion, sending status
-        # updates to the tracking server when finished. Note that the run state may not be
-        # persisted to the tracking server if interrupted
-        if synchronous:
-            command += _get_entry_point_command(project, entry_point, parameters, storage_dir)
-            command = command_separator.join(command)
-            return _run_entry_point(command, work_dir, experiment_id,
-                                    run_id=active_run.info.run_id)
-        # Otherwise, invoke `mlflow run` in a subprocess
-        return _invoke_mlflow_run_subprocess(
-            work_dir=work_dir, entry_point=entry_point, parameters=parameters,
-            experiment_id=experiment_id,
-            use_conda=use_conda, storage_dir=storage_dir, run_id=active_run.info.run_id)
-    elif backend == "kubernetes":
-        from mlflow.projects import kubernetes as kb
-        tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_ENV, "docker")
-        tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_BACKEND,
-                                        "kubernetes")
-        _validate_docker_env(project)
-        _validate_docker_installation()
-        kube_config = _parse_kubernetes_config(backend_config)
-        image = _build_docker_image(work_dir=work_dir,
-                                    image_uri=kube_config["image-uri"],
-                                    base_image=project.docker_env.get('image'),
-                                    run_id=active_run.info.run_id)
-        image_digest = kb.push_image_to_registry(image.tags[0])
-        submitted_run = kb.run_kubernetes_job(project.name,
-                                              active_run,
-                                              image.tags[0],
-                                              image_digest,
-                                              _get_entry_point_command(project, entry_point,
-                                                                       parameters, storage_dir),
-                                              _get_run_env_vars(
-                                                run_id=active_run.info.run_uuid,
-                                                experiment_id=active_run.info.experiment_id),
-                                              kube_config['kube-context'],
-                                              kube_config['kube-job-template'])
-        return submitted_run
-
-    supported_backends = ["local", "databricks", "kubernetes"]
-    raise ExecutionException("Got unsupported execution mode %s. Supported "
-                             "values: %s" % (backend, supported_backends))
 
 
 def run(uri, entry_point="main", version=None, parameters=None,
@@ -241,6 +103,97 @@ def run(uri, entry_point="main", version=None, parameters=None,
              about the launched run.
     """
 
+    _validate_backend_prerequisite(backend, tracking.get_tracking_uri(), backend_config)
+    cluster_spec_dict = _get_backend_config(backend_config)
+
+    parameters = parameters or {}
+    work_dir = _fetch_project(uri=uri, force_tempdir=False, version=version)
+    project = _project_spec.load_project(work_dir)
+    project.get_entry_point(entry_point)._validate_parameters(parameters)
+
+    _validate_project_execution_on_backend(backend, project)
+
+    experiment_id = _resolve_experiment_id(experiment_name=experiment_name,
+                                           experiment_id=experiment_id)
+    if run_id:
+        active_run = tracking.MlflowClient().get_run(run_id)
+    else:
+        active_run = _create_run(uri, experiment_id, work_dir, entry_point)
+
+    _log_params(active_run, entry_point, parameters, project)
+    _log_git_tags(active_run, work_dir, version)
+
+    if backend == "databricks":
+        submitted_run_obj = _submit_databrick_run(active_run, entry_point, parameters,
+                                                  work_dir, cluster_spec_dict, uri)
+    elif backend == "kubernetes":
+        submitted_run_obj = _submit_kubernetes_run(active_run, project, entry_point, parameters,
+                                                   work_dir, cluster_spec_dict, storage_dir)
+    elif backend == "local" or backend is None:
+        if synchronous:
+            submitted_run_obj = _submit_sync_local_run(active_run, project, entry_point, parameters,
+                                                       work_dir, use_conda, storage_dir)
+        else:
+            submitted_run_obj = _submit_async_local_run(active_run, entry_point, parameters, work_dir,
+                                                        use_conda, storage_dir)
+    else:
+        supported_backends = ["local", "databricks", "kubernetes"]
+        raise ExecutionException("Got unsupported execution mode %s. Supported "
+                                 "values: %s" % (backend, supported_backends))
+
+    if synchronous:
+        _wait_for(submitted_run_obj)
+    return submitted_run_obj
+
+
+def _resolve_experiment_id(experiment_name=None, experiment_id=None):
+    """
+    Resolve experiment.
+
+    Verifies either one or other is specified - cannot be both selected.
+
+    :param experiment_name: Name of experiment under which to launch the run.
+    :param experiment_id: ID of experiment under which to launch the run.
+    :return: int
+    """
+
+    if experiment_name and experiment_id:
+        raise MlflowException("Specify only one of 'experiment_name' or 'experiment_id'.")
+
+    exp_id = experiment_id
+    if experiment_name:
+        client = tracking.MlflowClient()
+        exp_id = client.get_experiment_by_name(experiment_name).experiment_id
+    exp_id = exp_id or _get_experiment_id()
+    return exp_id
+
+
+def _validate_project_execution_on_backend(backend, project):
+    """
+    Validation of execution environment
+
+    :param project:
+    :param backend:
+    :return:
+    """
+    if backend == "databricks":
+        import mlflow.projects.databricks
+        mlflow.projects.databricks.validate_project_execution(project)
+    elif backend == "kubernetes":
+        import mlflow.projects.kubernetes
+        mlflow.projects.kubernetes.validate_project_execution(project)
+
+
+def _validate_backend_prerequisite(backend, tracking_uri, backend_config):
+    if backend == "databricks":
+        import mlflow.projects.databricks
+        mlflow.projects.databricks.before_run_validations(tracking_uri, backend_config)
+    elif backend == "kubernetes":
+        import mlflow.projects.kubernetes
+        mlflow.projects.kubernetes.before_run_validations(tracking_uri, backend_config)
+
+
+def _get_backend_config(backend_config):
     cluster_spec_dict = backend_config
     if (backend_config and type(backend_config) != dict
             and os.path.splitext(backend_config)[-1] == ".json"):
@@ -252,20 +205,168 @@ def run(uri, entry_point="main", version=None, parameters=None,
                     "Error when attempting to load and parse JSON cluster spec from file %s",
                     backend_config)
                 raise
+    return cluster_spec_dict
 
-    if backend == "databricks":
-        mlflow.projects.databricks.before_run_validations(mlflow.get_tracking_uri(), backend_config)
 
-    experiment_id = _resolve_experiment_id(experiment_name=experiment_name,
-                                           experiment_id=experiment_id)
+def _get_entry_point_command(project, entry_point, parameters, storage_dir):
+    """
+    Returns the shell command to execute in order to run the specified entry point.
+    :param project: Project containing the target entry point
+    :param entry_point: Entry point to run
+    :param parameters: Parameters (dictionary) for the entry point command
+    :param storage_dir: Base local directory to use for downloading remote artifacts passed to
+                        arguments of type 'path'. If None, a temporary base directory is used.
+    """
+    storage_dir_for_run = _get_storage_dir(storage_dir)
+    _logger.info(
+        "=== Created directory %s for downloading remote URIs passed to arguments of"
+        " type 'path' ===",
+        storage_dir_for_run)
+    commands = []
+    commands.append(
+        project.get_entry_point(entry_point).compute_command(parameters, storage_dir_for_run))
+    return commands
 
-    submitted_run_obj = _run(
-        uri=uri, experiment_id=experiment_id, entry_point=entry_point, version=version,
-        parameters=parameters, backend=backend, backend_config=cluster_spec_dict,
-        use_conda=use_conda, storage_dir=storage_dir, synchronous=synchronous, run_id=run_id)
-    if synchronous:
-        _wait_for(submitted_run_obj)
-    return submitted_run_obj
+
+def _log_params(active_run, entry_point, parameters, project):
+    # Consolidate parameters for logging.
+    # `storage_dir` is `None` since we want to log actual path not downloaded local path
+    entry_point_obj = project.get_entry_point(entry_point)
+    final_params, extra_params = entry_point_obj.compute_parameters(parameters, storage_dir=None)
+    for key, value in (list(final_params.items()) + list(extra_params.items())):
+        tracking.MlflowClient().log_param(active_run.info.run_id, key, value)
+
+
+def _log_git_tags(active_run, work_dir, version):
+    repo_url = _get_git_repo_url(work_dir)
+    if repo_url is not None:
+        for tag in [MLFLOW_GIT_REPO_URL, LEGACY_MLFLOW_GIT_REPO_URL]:
+            tracking.MlflowClient().set_tag(active_run.info.run_id, tag, repo_url)
+    # Add branch name tag if a branch is specified through -version
+    if _is_valid_branch_name(work_dir, version):
+        for tag in [MLFLOW_GIT_BRANCH, LEGACY_MLFLOW_GIT_BRANCH_NAME]:
+            tracking.MlflowClient().set_tag(active_run.info.run_id, tag, version)
+
+
+def _submit_async_local_run(active_run, entry_point, parameters,
+                            work_dir, use_conda, storage_dir):
+    """
+    Helper that delegates to the project-running method corresponding to the passed-in backend.
+    Returns a ``SubmittedRun`` corresponding to the project run.
+    """
+    from mlflow.projects.local import run_mlflow_subprocess
+
+    # invoke `mlflow run` in a subprocess
+    return run_mlflow_subprocess(
+        work_dir=work_dir, entry_point=entry_point, parameters=parameters,
+        active_run=active_run, use_conda=use_conda, storage_dir=storage_dir)
+
+
+def _submit_sync_local_run(active_run, project, entry_point, parameters,
+                      work_dir, use_conda, storage_dir):
+    """
+    Helper that delegates to the project-running method corresponding to the passed-in backend.
+    Returns a ``SubmittedRun`` corresponding to the project run.
+    """
+    from mlflow.projects.local import run_entry_point
+
+    command = []
+    command_separator = " "
+    # If a docker_env attribute is defined in MLproject then it takes precedence over conda yaml
+    # environments, so the project will be executed inside a docker container.
+    if project.docker_env:
+        tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_ENV,
+                                        "docker")
+        tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_BACKEND,
+                                        "local")
+        _validate_docker_env(project)
+        _validate_docker_installation()
+        image = _build_docker_image(work_dir=work_dir,
+                                    image_uri=project.name,
+                                    base_image=project.docker_env.get('image'),
+                                    run_id=active_run.info.run_id)
+        command += _get_docker_command(image=image, active_run=active_run)
+    # Synchronously create a conda environment (even though this may take some time)
+    # to avoid failures due to multiple concurrent attempts to create the same conda env.
+    elif use_conda:
+        tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_ENV, "conda")
+        tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_BACKEND, "local")
+        command_separator = " && "
+        conda_env_name = _get_or_create_conda_env(project.conda_env_path)
+        command += _get_conda_command(conda_env_name)
+    # In synchronous mode, run the entry point command in a blocking fashion, sending status
+    # updates to the tracking server when finished. Note that the run state may not be
+    # persisted to the tracking server if interrupted
+    command += _get_entry_point_command(project, entry_point, parameters, storage_dir)
+    command = command_separator.join(command)
+    return run_entry_point(command, active_run, work_dir)
+
+
+def _submit_kubernetes_run(active_run, project, entry_point, parameters, work_dir, backend_config,
+                           storage_dir):
+    from mlflow.projects import kubernetes as kb
+    tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_ENV, "docker")
+    tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_BACKEND,
+                                    "kubernetes")
+    _validate_docker_env(project)
+    _validate_docker_installation()
+    kube_config = kb.parse_kubernetes_config(backend_config)
+    image = _build_docker_image(work_dir=work_dir,
+                                image_uri=kube_config["image-uri"],
+                                base_image=project.docker_env.get('image'),
+                                run_id=active_run.info.run_id)
+    image_digest = kb.push_image_to_registry(image.tags[0])
+    submitted_run = kb.run_kubernetes_job(project.name,
+                                          active_run,
+                                          image.tags[0],
+                                          image_digest,
+                                          _get_entry_point_command(project, entry_point,
+                                                                   parameters, storage_dir),
+                                          get_run_env_vars(active_run),
+                                          kube_config['kube-context'],
+                                          kube_config['kube-job-template'])
+    return submitted_run
+
+
+def _submit_databrick_run(active_run, entry_point, parameters, work_dir, backend_config, uri):
+    tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_BACKEND,
+                                    "databricks")
+    from mlflow.projects.databricks import run_databricks
+    return run_databricks(
+        remote_run=active_run, entry_point=entry_point, parameters=parameters,
+        uri=uri, work_dir=work_dir, cluster_spec=backend_config)
+
+
+def _create_run(uri, experiment_id, work_dir, entry_point):
+    """
+    Create a ``Run`` against the current MLflow tracking server, logging metadata (e.g. the URI,
+    entry point, and parameters of the project) about the run. Return an ``ActiveRun`` that can be
+    used to report additional data about the run (metrics/params) to the tracking server.
+    """
+    if _is_local_uri(uri):
+        source_name = tracking.utils._get_git_url_if_present(_expand_uri(uri))
+    else:
+        source_name = _expand_uri(uri)
+    source_version = _get_git_commit(work_dir)
+    existing_run = fluent.active_run()
+    if existing_run:
+        parent_run_id = existing_run.info.run_id
+    else:
+        parent_run_id = None
+
+    tags = {
+        MLFLOW_USER: _get_user(),
+        MLFLOW_SOURCE_NAME: source_name,
+        MLFLOW_SOURCE_TYPE: SourceType.to_string(SourceType.PROJECT),
+        MLFLOW_PROJECT_ENTRY_POINT: entry_point
+    }
+    if source_version is not None:
+        tags[MLFLOW_GIT_COMMIT] = source_version
+    if parent_run_id is not None:
+        tags[MLFLOW_PARENT_RUN_ID] = parent_run_id
+
+    active_run = tracking.MlflowClient().create_run(experiment_id=experiment_id, tags=tags)
+    return active_run
 
 
 def _wait_for(submitted_run_obj):
@@ -300,12 +401,6 @@ def _parse_subdirectory(uri):
     if subdirectory and '.' in subdirectory:
         raise ExecutionException("'.' is not allowed in project subdirectory paths.")
     return parsed_uri, subdirectory
-
-
-def _get_storage_dir(storage_dir):
-    if storage_dir is not None and not os.path.exists(storage_dir):
-        os.makedirs(storage_dir)
-    return tempfile.mkdtemp(dir=storage_dir)
 
 
 def _get_git_repo_url(work_dir):
@@ -512,139 +607,6 @@ def _maybe_set_run_terminated(active_run, status):
     tracking.MlflowClient().set_terminated(run_id, status)
 
 
-def _get_entry_point_command(project, entry_point, parameters, storage_dir):
-    """
-    Returns the shell command to execute in order to run the specified entry point.
-    :param project: Project containing the target entry point
-    :param entry_point: Entry point to run
-    :param parameters: Parameters (dictionary) for the entry point command
-    :param storage_dir: Base local directory to use for downloading remote artifacts passed to
-                        arguments of type 'path'. If None, a temporary base directory is used.
-    """
-    storage_dir_for_run = _get_storage_dir(storage_dir)
-    _logger.info(
-        "=== Created directory %s for downloading remote URIs passed to arguments of"
-        " type 'path' ===",
-        storage_dir_for_run)
-    commands = []
-    commands.append(
-        project.get_entry_point(entry_point).compute_command(parameters, storage_dir_for_run))
-    return commands
-
-
-def _run_entry_point(command, work_dir, experiment_id, run_id):
-    """
-    Run an entry point command in a subprocess, returning a SubmittedRun that can be used to
-    query the run's status.
-    :param command: Entry point command to run
-    :param work_dir: Working directory in which to run the command
-    :param run_id: MLflow run ID associated with the entry point execution.
-    """
-    env = os.environ.copy()
-    env.update(_get_run_env_vars(run_id, experiment_id))
-    _logger.info("=== Running command '%s' in run with ID '%s' === ", command, run_id)
-    # in case os name is not 'nt', we are not running on windows. It introduces
-    # bash command otherwise.
-    if os.name != "nt":
-        process = subprocess.Popen(["bash", "-c", command], close_fds=True, cwd=work_dir, env=env)
-    else:
-        process = subprocess.Popen(command, close_fds=True, cwd=work_dir, env=env)
-    return LocalSubmittedRun(run_id, process)
-
-
-def _build_mlflow_run_cmd(
-        uri, entry_point, storage_dir, use_conda, run_id, parameters):
-    """
-    Build and return an array containing an ``mlflow run`` command that can be invoked to locally
-    run the project at the specified URI.
-    """
-    mlflow_run_arr = ["mlflow", "run", uri, "-e", entry_point, "--run-id", run_id]
-    if storage_dir is not None:
-        mlflow_run_arr.extend(["--storage-dir", storage_dir])
-    if not use_conda:
-        mlflow_run_arr.append("--no-conda")
-    for key, value in parameters.items():
-        mlflow_run_arr.extend(["-P", "%s=%s" % (key, value)])
-    return mlflow_run_arr
-
-
-def _run_mlflow_run_cmd(mlflow_run_arr, env_map):
-    """
-    Invoke ``mlflow run`` in a subprocess, which in turn runs the entry point in a child process.
-    Returns a handle to the subprocess. Popen launched to invoke ``mlflow run``.
-    """
-    final_env = os.environ.copy()
-    final_env.update(env_map)
-    # Launch `mlflow run` command as the leader of its own process group so that we can do a
-    # best-effort cleanup of all its descendant processes if needed
-    if sys.platform == "win32":
-        return subprocess.Popen(
-            mlflow_run_arr, env=final_env, universal_newlines=True,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
-    else:
-        return subprocess.Popen(
-            mlflow_run_arr, env=final_env, universal_newlines=True, preexec_fn=os.setsid)
-
-
-def _create_run(uri, experiment_id, work_dir, entry_point):
-    """
-    Create a ``Run`` against the current MLflow tracking server, logging metadata (e.g. the URI,
-    entry point, and parameters of the project) about the run. Return an ``ActiveRun`` that can be
-    used to report additional data about the run (metrics/params) to the tracking server.
-    """
-    if _is_local_uri(uri):
-        source_name = tracking.utils._get_git_url_if_present(_expand_uri(uri))
-    else:
-        source_name = _expand_uri(uri)
-    source_version = _get_git_commit(work_dir)
-    existing_run = fluent.active_run()
-    if existing_run:
-        parent_run_id = existing_run.info.run_id
-    else:
-        parent_run_id = None
-
-    tags = {
-        MLFLOW_USER: _get_user(),
-        MLFLOW_SOURCE_NAME: source_name,
-        MLFLOW_SOURCE_TYPE: SourceType.to_string(SourceType.PROJECT),
-        MLFLOW_PROJECT_ENTRY_POINT: entry_point
-    }
-    if source_version is not None:
-        tags[MLFLOW_GIT_COMMIT] = source_version
-    if parent_run_id is not None:
-        tags[MLFLOW_PARENT_RUN_ID] = parent_run_id
-
-    active_run = tracking.MlflowClient().create_run(experiment_id=experiment_id, tags=tags)
-    return active_run
-
-
-def _get_run_env_vars(run_id, experiment_id):
-    """
-    Returns a dictionary of environment variable key-value pairs to set in subprocess launched
-    to run MLflow projects.
-    """
-    return {
-        tracking._RUN_ID_ENV_VAR: run_id,
-        tracking._TRACKING_URI_ENV_VAR: tracking.get_tracking_uri(),
-        tracking._EXPERIMENT_ID_ENV_VAR: str(experiment_id),
-    }
-
-
-def _invoke_mlflow_run_subprocess(
-        work_dir, entry_point, parameters, experiment_id, use_conda, storage_dir, run_id):
-    """
-    Run an MLflow project asynchronously by invoking ``mlflow run`` in a subprocess, returning
-    a SubmittedRun that can be used to query run status.
-    """
-    _logger.info("=== Asynchronously launching MLflow run with ID %s ===", run_id)
-    mlflow_run_arr = _build_mlflow_run_cmd(
-        uri=work_dir, entry_point=entry_point, storage_dir=storage_dir, use_conda=use_conda,
-        run_id=run_id, parameters=parameters)
-    mlflow_run_subprocess = _run_mlflow_run_cmd(
-        mlflow_run_arr, _get_run_env_vars(run_id, experiment_id))
-    return LocalSubmittedRun(run_id, mlflow_run_subprocess)
-
-
 def _get_conda_command(conda_env_name):
     activate_path = _get_conda_bin_executable("activate")
     # in case os name is not 'nt', we are not running on windows. It introduces
@@ -653,12 +615,6 @@ def _get_conda_command(conda_env_name):
         return ["source %s %s" % (activate_path, conda_env_name)]
     else:
         return ["conda %s %s" % (activate_path, conda_env_name)]
-
-
-def _validate_execution_environment(project, backend):
-    if project.docker_env and backend == "databricks":
-        raise ExecutionException(
-            "Running docker-based projects on Databricks is not yet supported.")
 
 
 def _get_local_uri_or_none(uri):
@@ -676,18 +632,23 @@ def _get_local_uri_or_none(uri):
         return None, None
 
 
+def _get_storage_dir(storage_dir):
+    if storage_dir is not None and not os.path.exists(storage_dir):
+        os.makedirs(storage_dir)
+    return tempfile.mkdtemp(dir=storage_dir)
+
+
 def _get_docker_command(image, active_run):
     docker_path = "docker"
     cmd = [docker_path, "run", "--rm"]
-    env_vars = _get_run_env_vars(run_id=active_run.info.run_id,
-                                 experiment_id=active_run.info.experiment_id)
+    env_vars = get_run_env_vars(active_run)
     tracking_uri = tracking.get_tracking_uri()
     local_path, container_tracking_uri = _get_local_uri_or_none(tracking_uri)
     if local_path is not None:
         cmd += ["-v", "%s:%s" % (local_path, _MLFLOW_DOCKER_TRACKING_DIR_PATH)]
         env_vars[tracking._TRACKING_URI_ENV_VAR] = container_tracking_uri
     if tracking.utils._is_databricks_uri(tracking_uri):
-        db_profile = mlflow.tracking.utils.get_db_profile_from_uri(tracking_uri)
+        db_profile = tracking.utils.get_db_profile_from_uri(tracking_uri)
         config = databricks_utils.get_databricks_host_creds(db_profile)
         # We set these via environment variables so that only the current profile is exposed, rather
         # than all profiles in ~/.databrickscfg; maybe better would be to mount the necessary
@@ -729,32 +690,6 @@ def _validate_docker_env(project):
     if not project.docker_env.get('image'):
         raise ExecutionException("Project with docker environment must specify the docker image "
                                  "to use via an 'image' field under the 'docker_env' field.")
-
-
-def _parse_kubernetes_config(backend_config):
-    """
-    Creates build context tarfile containing Dockerfile and project code, returning path to tarfile
-    """
-    if not backend_config:
-        raise ExecutionException("Backend_config file not found.")
-    kube_config = backend_config.copy()
-    if 'kube-job-template-path' not in backend_config.keys():
-        raise ExecutionException("'kube-job-template-path' attribute must be specified in "
-                                 "backend_config.")
-    kube_job_template = backend_config['kube-job-template-path']
-    if os.path.exists(kube_job_template):
-        with open(kube_job_template, 'r') as job_template:
-            yaml_obj = yaml.safe_load(job_template.read())
-        kube_job_template = yaml_obj
-        kube_config['kube-job-template'] = kube_job_template
-    else:
-        raise ExecutionException("Could not find 'kube-job-template-path': {}".format(
-            kube_job_template))
-    if 'kube-context' not in backend_config.keys():
-        raise ExecutionException("Could not find kube-context in backend_config.")
-    if 'image-uri' not in backend_config.keys():
-        raise ExecutionException("Could not find 'image-uri' in backend_config.")
-    return kube_config
 
 
 def _create_docker_build_ctx(work_dir, dockerfile_contents):

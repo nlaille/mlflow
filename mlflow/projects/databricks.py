@@ -50,6 +50,12 @@ def before_run_validations(tracking_uri, backend_config):
             "MLFLOW_TRACKING_URI environment variable." % tracking_uri)
 
 
+def validate_project_execution(project):
+    if project.docker_env:
+        raise ExecutionException(
+            "Running docker-based projects on Databricks is not yet supported.")
+
+
 class DatabricksJobRunner(object):
     """
     Helper class for running an MLflow project as a Databricks Job.
@@ -259,13 +265,14 @@ def _get_databricks_run_cmd(dbfs_fuse_tar_uri, run_id, entry_point, parameters):
     return ["bash", "-c", shell_command]
 
 
-def run_databricks(remote_run, uri, entry_point, work_dir, parameters, experiment_id, cluster_spec):
+def run_databricks(remote_run, uri, entry_point, work_dir, parameters, cluster_spec):
     """
     Run the project at the specified URI on Databricks, returning a ``SubmittedRun`` that can be
     used to query the run's status or wait for the resulting Databricks Job run to terminate.
     """
     profile = tracking.utils.get_db_profile_from_uri(tracking.get_tracking_uri())
     run_id = remote_run.info.run_id
+    experiment_id = remote_run.info.experiment_id
     db_job_runner = DatabricksJobRunner(databricks_profile=profile)
     db_run_id = db_job_runner.run_databricks(
         uri, entry_point, work_dir, parameters, experiment_id, cluster_spec, run_id)
